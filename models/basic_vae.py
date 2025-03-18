@@ -99,7 +99,7 @@ def make_attn(in_channels, using_sa=True):
 class Encoder(nn.Module):
     def __init__(
         self, *, ch=128, ch_mult=(1, 2, 4, 8), num_res_blocks=2,
-        dropout=0.0, in_channels=3,
+        dropout=0.0, in_channels=1,
         z_channels, double_z=False, using_sa=True, using_mid_sa=True,
     ):
         super().__init__()
@@ -223,4 +223,8 @@ class Decoder(nn.Module):
         
         # end
         h = self.conv_out(F.silu(self.norm_out(h), inplace=True))
+
+        if self.in_channels == 1:
+            h = torch.sigmoid(h)
+            
         return h

@@ -21,7 +21,7 @@ class SharedAdaLin(nn.Linear):
 class VAR(nn.Module):
     def __init__(
         self, vae_local: VQVAE,
-        num_classes=1000, depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
+        depth=16, embed_dim=1024, num_heads=16, mlp_ratio=4., drop_rate=0., attn_drop_rate=0., drop_path_rate=0.,
         norm_eps=1e-6, shared_aln=False, cond_drop_rate=0.1,
         attn_l2_norm=False,
         patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16),   # 10 steps by default
@@ -54,12 +54,8 @@ class VAR(nn.Module):
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
         self.word_embed = nn.Linear(self.Cvae, self.C)
         
-        # 2. class embedding
+        # Static start token
         init_std = math.sqrt(1 / self.C / 3)
-        self.num_classes = num_classes
-        self.uniform_prob = torch.full((1, num_classes), fill_value=1.0 / num_classes, dtype=torch.float32, device=dist.get_device())
-        self.class_emb = nn.Embedding(self.num_classes + 1, self.C)
-        nn.init.trunc_normal_(self.class_emb.weight.data, mean=0, std=init_std)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
         
@@ -76,9 +72,7 @@ class VAR(nn.Module):
         self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
         
-        # 4. backbone blocks
-        self.shared_ada_lin = nn.Sequential(nn.SiLU(inplace=False), SharedAdaLin(self.D, 6*self.C)) if shared_aln else nn.Identity()
-        
+        # 4. backbone blocks        
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
@@ -115,26 +109,22 @@ class VAR(nn.Module):
         self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
-    def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]], cond_BD: Optional[torch.Tensor]):
+    def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]):
         if not isinstance(h_or_h_and_residual, torch.Tensor):
             h, resi = h_or_h_and_residual   # fused_add_norm must be used
             h = resi + self.blocks[-1].drop_path(h)
         else:                               # fused_add_norm is not used
             h = h_or_h_and_residual
-        return self.head(self.head_nm(h.float(), cond_BD).float()).float()
+        return self.head(self.head_nm(h.float()).float()).float()
     
     @torch.no_grad()
     def autoregressive_infer_cfg(
-        self, B: int, label_B: Optional[Union[int, torch.LongTensor]],
-        g_seed: Optional[int] = None, cfg=1.5, top_k=0, top_p=0.0,
-        more_smooth=False,
+        self, B: int, g_seed: Optional[int] = None, top_k=0, top_p=0.0, more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
         :param B: batch size
-        :param label_B: imagenet label; if None, randomly sampled
         :param g_seed: random seed
-        :param cfg: classifier-free guidance ratio
         :param top_k: top-k sampling
         :param top_p: top-p sampling
         :param more_smooth: smoothing the pred using gumbel softmax; only used in visualization, not used in FID/IS benchmarking
@@ -143,35 +133,23 @@ class VAR(nn.Module):
         if g_seed is None: rng = None
         else: self.rng.manual_seed(g_seed); rng = self.rng
         
-        if label_B is None:
-            label_B = torch.multinomial(self.uniform_prob, num_samples=B, replacement=True, generator=rng).reshape(B)
-        elif isinstance(label_B, int):
-            label_B = torch.full((B,), fill_value=self.num_classes if label_B < 0 else label_B, device=self.lvl_1L.device)
-        
-        sos = cond_BD = self.class_emb(torch.cat((label_B, torch.full_like(label_B, fill_value=self.num_classes)), dim=0))
+        # Initialize the autoregressive sequence with static start token
+        next_token_map = self.pos_start.expand(B, self.first_l, -1) + self.pos_1LC[:, :self.first_l]
 
-        lvl_pos = self.lvl_embed(self.lvl_1L) + self.pos_1LC
-        next_token_map = sos.unsqueeze(1).expand(2 * B, self.first_l, -1) + self.pos_start.expand(2 * B, self.first_l, -1) + lvl_pos[:, :self.first_l]
-        
         cur_L = 0
-        f_hat = sos.new_zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1])
+        f_hat = torch.zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1], device=next_token_map.device)
         
         for b in self.blocks: b.attn.kv_caching(True)
+
         for si, pn in enumerate(self.patch_nums):   # si: i-th segment
             ratio = si / self.num_stages_minus_1
-            # last_L = cur_L
             cur_L += pn*pn
-            # assert self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].sum() == 0, f'AR with {(self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L] != 0).sum()} / {self.attn_bias_for_masking[:, :, last_L:cur_L, :cur_L].numel()} mask item'
-            cond_BD_or_gss = self.shared_ada_lin(cond_BD)
+            
             x = next_token_map
-
             AdaLNSelfAttn.forward
             for b in self.blocks:
-                x = b(x=x, cond_BD=cond_BD_or_gss, attn_bias=None)
-            logits_BlV = self.get_logits(x, cond_BD)
-            
-            t = cfg * ratio
-            logits_BlV = (1+t) * logits_BlV[:B] - t * logits_BlV[B:]
+                x = b(x=x, attn_bias=None)
+            logits_BlV = self.get_logits(x)
             
             idx_Bl = sample_with_top_k_top_p_(logits_BlV, rng=rng, top_k=top_k, top_p=top_p, num_samples=1)[:, :, 0]
             
@@ -183,57 +161,61 @@ class VAR(nn.Module):
             
             h_BChw = h_BChw.transpose_(1, 2).reshape(B, self.Cvae, pn, pn)
             f_hat, next_token_map = self.vae_quant_proxy[0].get_next_autoregressive_input(si, len(self.patch_nums), f_hat, h_BChw)
-            if si != self.num_stages_minus_1:   # prepare for next stage
+
+            if si != self.num_stages_minus_1:  # Prepare for next stage
                 next_token_map = next_token_map.view(B, self.Cvae, -1).transpose(1, 2)
-                next_token_map = self.word_embed(next_token_map) + lvl_pos[:, cur_L:cur_L + self.patch_nums[si+1] ** 2]
-                next_token_map = next_token_map.repeat(2, 1, 1)   # double the batch sizes due to CFG
-        
+                next_token_map = self.word_embed(next_token_map) + self.pos_1LC[:, cur_L:cur_L + self.patch_nums[si + 1] ** 2]
+
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
-    def forward(self, label_B: torch.LongTensor, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
-        :param label_B: label_B
         :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
         :return: logits BLV, V is vocab_size
         """
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
+        
         with torch.cuda.amp.autocast(enabled=False):
-            label_B = torch.where(torch.rand(B, device=label_B.device) < self.cond_drop_rate, self.num_classes, label_B)
-            sos = cond_BD = self.class_emb(label_B)
-            sos = sos.unsqueeze(1).expand(B, self.first_l, -1) + self.pos_start.expand(B, self.first_l, -1)
+            # Initialize SOS (without class embedding)
+            sos = self.pos_start.expand(B, self.first_l, -1)
+
+            # Prepare input for transformer blocks
+            if self.prog_si == 0:
+                x_BLC = sos
+            else:
+                x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
             
-            if self.prog_si == 0: x_BLC = sos
-            else: x_BLC = torch.cat((sos, self.word_embed(x_BLCv_wo_first_l.float())), dim=1)
-            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed] # lvl: BLC;  pos: 1LC
-        
+            # Add level & positional embeddings
+            x_BLC += self.lvl_embed(self.lvl_1L[:, :ed].expand(B, -1)) + self.pos_1LC[:, :ed]  
+
         attn_bias = self.attn_bias_for_masking[:, :, :ed, :ed]
-        cond_BD_or_gss = self.shared_ada_lin(cond_BD)
-        
-        # hack: get the dtype if mixed precision is used
+
+        # Hack: Get the dtype if mixed precision is used
         temp = x_BLC.new_ones(8, 8)
         main_type = torch.matmul(temp, temp).dtype
-        
+
+        # Convert tensors to proper dtype
         x_BLC = x_BLC.to(dtype=main_type)
-        cond_BD_or_gss = cond_BD_or_gss.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
-        
+
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):
-            x_BLC = b(x=x_BLC, cond_BD=cond_BD_or_gss, attn_bias=attn_bias)
-        x_BLC = self.get_logits(x_BLC.float(), cond_BD)
-        
+            x_BLC = b(x=x_BLC, attn_bias=attn_bias)  # Removed `cond_BD_or_gss`
+
+        x_BLC = self.get_logits(x_BLC.float(), None)  # Removed `cond_BD`
+
+        # Ensure stability for first token (Only required in first stage)
         if self.prog_si == 0:
             if isinstance(self.word_embed, nn.Linear):
                 x_BLC[0, 0, 0] += self.word_embed.weight[0, 0] * 0 + self.word_embed.bias[0] * 0
             else:
-                s = 0
-                for p in self.word_embed.parameters():
-                    if p.requires_grad:
-                        s += p.view(-1)[0] * 0
+                s = sum(p.view(-1)[0] * 0 for p in self.word_embed.parameters() if p.requires_grad)
                 x_BLC[0, 0, 0] += s
-        return x_BLC    # logits BLV, V is vocab_size
+
+        return x_BLC  # logits BLV, V is vocab_size
+
     
     def init_weights(self, init_adaln=0.5, init_adaln_gamma=1e-5, init_head=0.02, init_std=0.02, conv_std_or_gain=0.02):
         if init_std < 0: init_std = (1 / self.C / 3) ** 0.5     # init_std < 0: automated

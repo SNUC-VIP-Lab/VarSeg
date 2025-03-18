@@ -24,6 +24,7 @@ class VQVAE(nn.Module):
         default_qresi_counts=0, # if is 0: automatically set to len(v_patch_nums)
         v_patch_nums=(1, 2, 3, 4, 5, 6, 8, 10, 13, 16), # number of patches for each scale, h_{1 to K} = w_{1 to K} = v_patch_nums[k]
         test_mode=True,
+        in_channels = 1
     ):
         super().__init__()
         self.test_mode = test_mode
@@ -31,7 +32,7 @@ class VQVAE(nn.Module):
         # ddconfig is copied from https://github.com/CompVis/latent-diffusion/blob/e66308c7f2e64cb581c6d27ab6fbeb846828253b/models/first_stage_models/vq-f16/config.yaml
         ddconfig = dict(
             dropout=dropout, ch=ch, z_channels=z_channels,
-            in_channels=3, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
+            in_channels=1, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
             using_sa=True, using_mid_sa=True,                           # from vq-f16/config.yaml above
             # resamp_with_conv=True,   # always True, removed.
         )
