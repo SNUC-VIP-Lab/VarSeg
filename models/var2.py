@@ -7,6 +7,7 @@ import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
 import dist
+from models.basic_vae import Encoder
 from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
@@ -31,7 +32,7 @@ class VAR(nn.Module):
         # 0. hyperparameters
         assert embed_dim % num_heads == 0
         self.Cvae, self.V = vae_local.Cvae, vae_local.vocab_size
-        self.depth, self.C, self.D, self.num_heads = depth, embed_dim, embed_dim, num_heads
+        self.depth, self.C, self.num_heads = depth, embed_dim, num_heads
         
         self.cond_drop_rate = cond_drop_rate
         self.prog_si = -1   # progressive training
@@ -78,7 +79,6 @@ class VAR(nn.Module):
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
         self.blocks = nn.ModuleList([
             AdaLNSelfAttn(
-                cond_dim=self.D, shared_aln=shared_aln,
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
                 drop=drop_rate, attn_drop=attn_drop_rate, drop_path=dpr[block_idx], last_drop_p=0 if block_idx == 0 else dpr[block_idx-1],
                 attn_l2_norm=attn_l2_norm,
@@ -106,7 +106,7 @@ class VAR(nn.Module):
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
         # 6. classifier head
-        self.head_nm = AdaLNBeforeHead(self.C, self.D, norm_layer=norm_layer)
+        self.head_nm = AdaLNBeforeHead(self.C, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
     def get_logits(self, h_or_h_and_residual: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]):
@@ -177,7 +177,7 @@ class VAR(nn.Module):
         bg, ed = self.begin_ends[self.prog_si] if self.prog_si >= 0 else (0, self.L)
         B = x_BLCv_wo_first_l.shape[0]
         
-        with torch.cuda.amp.autocast(enabled=False):
+        with torch.amp.autocast('cuda', enabled=False):
             # Initialize SOS (without class embedding)
             sos = self.pos_start.expand(B, self.first_l, -1)
 
@@ -204,7 +204,7 @@ class VAR(nn.Module):
         for i, b in enumerate(self.blocks):
             x_BLC = b(x=x_BLC, attn_bias=attn_bias)  # Removed `cond_BD_or_gss`
 
-        x_BLC = self.get_logits(x_BLC.float(), None)  # Removed `cond_BD`
+        x_BLC = self.get_logits(x_BLC.float())  # Removed `cond_BD`
 
         # Ensure stability for first token (Only required in first stage)
         if self.prog_si == 0:
@@ -246,10 +246,10 @@ class VAR(nn.Module):
                 self.head[-1].weight.data.mul_(init_head)
                 self.head[-1].bias.data.zero_()
         
-        if isinstance(self.head_nm, AdaLNBeforeHead):
-            self.head_nm.ada_lin[-1].weight.data.mul_(init_adaln)
-            if hasattr(self.head_nm.ada_lin[-1], 'bias') and self.head_nm.ada_lin[-1].bias is not None:
-                self.head_nm.ada_lin[-1].bias.data.zero_()
+        # if isinstance(self.head_nm, AdaLNBeforeHead):
+        #     self.head_nm.ada_lin[-1].weight.data.mul_(init_adaln)
+        #     if hasattr(self.head_nm.ada_lin[-1], 'bias') and self.head_nm.ada_lin[-1].bias is not None:
+        #         self.head_nm.ada_lin[-1].bias.data.zero_()
         
         depth = len(self.blocks)
         for block_idx, sab in enumerate(self.blocks):

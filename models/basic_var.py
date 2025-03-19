@@ -160,6 +160,15 @@ class AdaLNSelfAttn(nn.Module):
         x = x + self.drop_path(self.ffn(self.ln_wo_grad(x)))
         return x
 
+class AdaLNBeforeHead(nn.Module):
+    def __init__(self, embed_dim, norm_layer):  
+        super().__init__()
+        self.C = embed_dim
+        self.ln = norm_layer(embed_dim, elementwise_affine=True)  # Keep learnable affine parameters
+
+    def forward(self, x_BLC: torch.Tensor):
+        return self.ln(x_BLC)
+    
 class CrossAttentionAR(nn.Module):
     def __init__(
         self, block_idx, dim=1024, num_heads=16, proj_drop=0., attn_l2_norm=False, flash_if_available=True,
