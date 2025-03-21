@@ -10,6 +10,7 @@ import dist
 from models import VAR, VQVAE, VectorQuantizer2
 from utils.amp_sc import AmpOptimizer
 from utils.misc import MetricLogger, TensorboardLogger
+from vqvae_utils import DiceLoss, FocalLoss, PerceptualLoss
 
 Ten = torch.Tensor
 FTen = torch.Tensor
@@ -33,9 +34,8 @@ class VARTrainer(object):
         del self.var_wo_ddp.rng
         self.var_wo_ddp.rng = torch.Generator(device=device)
         
-        self.label_smooth = label_smooth
-        self.train_loss = nn.CrossEntropyLoss(label_smoothing=label_smooth, reduction='none')
-        self.val_loss = nn.CrossEntropyLoss(label_smoothing=0.0, reduction='mean')
+        self.train_loss = DiceLoss(smooth=label_smooth)
+        self.val_loss = DiceLoss()
         self.L = sum(pn * pn for pn in patch_nums)
         self.last_l = patch_nums[-1] * patch_nums[-1]
         self.loss_weight = torch.ones(1, self.L, device=device) / self.L
@@ -56,19 +56,22 @@ class VARTrainer(object):
         tot = 0
         L_mean, L_tail, acc_mean, acc_tail = 0, 0, 0, 0
         stt = time.time()
+
         training = self.var_wo_ddp.training
         self.var_wo_ddp.eval()
-        for inp_B3HW, label_B in ld_val:
-            B, V = label_B.shape[0], self.vae_local.vocab_size
+
+        for inp_B3HW, mask_BHW in ld_val:
+            B, V = mask_BHW.shape[0], self.vae_local.vocab_size
             inp_B3HW = inp_B3HW.to(dist.get_device(), non_blocking=True)
-            label_B = label_B.to(dist.get_device(), non_blocking=True)
+            mask_BHW = mask_BHW.to(dist.get_device(), non_blocking=True)
             
-            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
+            gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(mask_BHW)
             gt_BL = torch.cat(gt_idx_Bl, dim=1)
             x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
             
             self.var_wo_ddp.forward
-            logits_BLV = self.var_wo_ddp(label_B, x_BLCv_wo_first_l)
+            logits_BLV = self.var_wo_ddp(x_BLCv_wo_first_l, inp_B3HW)
+
             L_mean += self.val_loss(logits_BLV.data.view(-1, V), gt_BL.view(-1)) * B
             L_tail += self.val_loss(logits_BLV.data[:, -self.last_l:].reshape(-1, V), gt_BL[:, -self.last_l:].reshape(-1)) * B
             acc_mean += (logits_BLV.data.argmax(dim=-1) == gt_BL).sum() * (100/gt_BL.shape[1])
@@ -85,7 +88,7 @@ class VARTrainer(object):
     
     def train_step(
         self, it: int, g_it: int, stepping: bool, metric_lg: MetricLogger, tb_lg: TensorboardLogger,
-        inp_B3HW: FTen, label_B: Union[ITen, FTen], prog_si: int, prog_wp_it: float,
+        inp_B3HW: FTen, mask_BHW: FTen, prog_si: int, prog_wp_it: float,
     ) -> Tuple[Optional[Union[Ten, float]], Optional[float]]:
         # if progressive training
         self.var_wo_ddp.prog_si = self.vae_local.quantize.prog_si = prog_si
@@ -99,16 +102,16 @@ class VARTrainer(object):
         if prog_si == len(self.patch_nums) - 1: prog_si = -1    # max prog, as if no prog
         
         # forward
-        B, V = label_B.shape[0], self.vae_local.vocab_size
+        B, V = mask_BHW.shape[0], self.vae_local.vocab_size
         self.var.require_backward_grad_sync = stepping
         
-        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(inp_B3HW)
+        gt_idx_Bl: List[ITen] = self.vae_local.img_to_idxBl(mask_BHW)
         gt_BL = torch.cat(gt_idx_Bl, dim=1)
         x_BLCv_wo_first_l: Ten = self.quantize_local.idxBl_to_var_input(gt_idx_Bl)
         
         with self.var_opt.amp_ctx:
             self.var_wo_ddp.forward
-            logits_BLV = self.var(label_B, x_BLCv_wo_first_l)
+            logits_BLV = self.var(x_BLCv_wo_first_l, inp_B3HW)
             loss = self.train_loss(logits_BLV.view(-1, V), gt_BL.view(-1)).view(B, -1)
             if prog_si >= 0:    # in progressive training
                 bg, ed = self.begin_ends[prog_si]

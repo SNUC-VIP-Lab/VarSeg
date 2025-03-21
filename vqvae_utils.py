@@ -4,6 +4,8 @@ import os
 from torch.utils.data import Dataset
 import torchvision.models as models
 from PIL import Image, ImageDraw
+import numpy as np
+from sklearn.metrics import confusion_matrix
 
 # Dice Loss
 class DiceLoss(nn.Module):
@@ -56,11 +58,31 @@ class PerceptualLoss(nn.Module):
         return loss
     
 # Dice Score (for evaluation)
+# def dice_score(y_pred, y_true):
+#     y_pred = torch.sigmoid(y_pred) > 0.5  # Convert to binary
+#     intersection = (y_pred * y_true).sum(dim=(2, 3))
+#     union = y_pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3))
+#     return ((2.0 * intersection + 1.0) / (union + 1.0)).mean().item()
 def dice_score(y_pred, y_true):
-    y_pred = torch.sigmoid(y_pred) > 0.5  # Convert to binary
-    intersection = (y_pred * y_true).sum(dim=(2, 3))
-    union = y_pred.sum(dim=(2, 3)) + y_true.sum(dim=(2, 3))
-    return ((2.0 * intersection + 1.0) / (union + 1.0)).mean().item()
+    y_pred = np.array(y_pred)
+    y_true = np.array(y_true)
+
+    y_pred = (y_pred > 0.5).astype(int)  # Ensure binary labels (0 or 1)
+    y_true = y_true.astype(int)  # Ensure binary labels (0 or 1)
+    
+    # print(y_pred.dtype, y_true.dtype, y_pred.shape, y_true.shape)
+
+    confusion = confusion_matrix(y_true.ravel(), y_pred.ravel())  # Flatten arrays
+    TN, FP, FN, TP = confusion.ravel()  # Ensure correct unpacking
+
+    accuracy = (TN + TP) / np.sum(confusion) if np.sum(confusion) != 0 else 0
+    sensitivity = TP / (TP + FN) if (TP + FN) != 0 else 0
+    specificity = TN / (TN + FP) if (TN + FP) != 0 else 0
+    f1_or_dsc = 2 * TP / (2 * TP + FP + FN) if (2 * TP + FP + FN) != 0 else 0
+    jaccard = TP / (TP + FP + FN) if (TP + FP + FN) != 0 else 0
+    miou = 0.5 * (TP / (TP + FP + FN) + TN / (TN + FP + FN))
+
+    return accuracy, sensitivity, specificity, f1_or_dsc, jaccard, miou
 
 # Dataset
 class CustomImageDataset(Dataset):

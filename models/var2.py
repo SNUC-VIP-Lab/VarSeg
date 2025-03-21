@@ -4,11 +4,12 @@ from typing import Optional, Tuple, Union
 
 import torch
 import torch.nn as nn
+from torch.nn import functional as F
 from huggingface_hub import PyTorchModelHubMixin
 
 import dist
 from models.basic_vae import Encoder
-from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn
+from models.basic_var import AdaLNBeforeHead, AdaLNSelfAttn, CrossAttentionAR
 from models.helpers import gumbel_softmax_with_rng, sample_with_top_k_top_p_
 from models.vqvae import VQVAE, VectorQuantizer2
 
@@ -48,19 +49,25 @@ class VAR(nn.Module):
         
         self.num_stages_minus_1 = len(self.patch_nums) - 1
         self.rng = torch.Generator(device=dist.get_device())
+
+        # 1. input (image) encoding
+        ddconfig = vae_local.ddconfig
+        ddconfig['in_channels'] = 3
+        self.img_encoder = Encoder(double_z=False, **ddconfig)
+        self.img_proj = nn.Linear(self.Cvae, self.C)
         
-        # 1. input (word) embedding
+        # 2. input (word) embedding
         quant: VectorQuantizer2 = vae_local.quantize
         self.vae_proxy: Tuple[VQVAE] = (vae_local,)
         self.vae_quant_proxy: Tuple[VectorQuantizer2] = (quant,)
         self.word_embed = nn.Linear(self.Cvae, self.C)
         
-        # Static start token
+        # 3. Static start token
         init_std = math.sqrt(1 / self.C / 3)
         self.pos_start = nn.Parameter(torch.empty(1, self.first_l, self.C))
         nn.init.trunc_normal_(self.pos_start.data, mean=0, std=init_std)
         
-        # 3. absolute position embedding
+        # 4. absolute position embedding
         pos_1LC = []
         for i, pn in enumerate(self.patch_nums):
             pe = torch.empty(1, pn*pn, self.C)
@@ -73,10 +80,17 @@ class VAR(nn.Module):
         self.lvl_embed = nn.Embedding(len(self.patch_nums), self.C)
         nn.init.trunc_normal_(self.lvl_embed.weight.data, mean=0, std=init_std)
         
-        # 4. backbone blocks        
+        # 5. backbone blocks        
         norm_layer = partial(nn.LayerNorm, eps=norm_eps)
         self.drop_path_rate = drop_path_rate
         dpr = [x.item() for x in torch.linspace(0, drop_path_rate, depth)]  # stochastic depth decay rule (linearly increasing)
+        self.cross_blocks = nn.ModuleList([
+            CrossAttentionAR(
+                block_idx=block_idx, dim=self.C, num_heads=num_heads,
+                flash_if_available=flash_if_available,
+            )
+            for block_idx in range(depth)
+        ])
         self.blocks = nn.ModuleList([
             AdaLNSelfAttn(
                 block_idx=block_idx, embed_dim=self.C, norm_layer=norm_layer, num_heads=num_heads, mlp_ratio=mlp_ratio,
@@ -96,7 +110,7 @@ class VAR(nn.Module):
             end='\n\n', flush=True
         )
         
-        # 5. attention mask used in training (for masking out the future)
+        # 6. attention mask used in training (for masking out the future)
         #    it won't be used in inference, since kv cache is enabled
         d: torch.Tensor = torch.cat([torch.full((pn*pn,), i) for i, pn in enumerate(self.patch_nums)]).view(1, self.L, 1)
         dT = d.transpose(1, 2)    # dT: 11L
@@ -105,7 +119,7 @@ class VAR(nn.Module):
         attn_bias_for_masking = torch.where(d >= dT, 0., -torch.inf).reshape(1, 1, self.L, self.L)
         self.register_buffer('attn_bias_for_masking', attn_bias_for_masking.contiguous())
         
-        # 6. classifier head
+        # 7. classifier head
         self.head_nm = AdaLNBeforeHead(self.C, norm_layer=norm_layer)
         self.head = nn.Linear(self.C, self.V)
     
@@ -116,10 +130,23 @@ class VAR(nn.Module):
         else:                               # fused_add_norm is not used
             h = h_or_h_and_residual
         return self.head(self.head_nm(h.float()).float()).float()
+
+    def encode_image(self, input_image: torch.Tensor) -> torch.Tensor:
+        B = input_image.shape[0]
+        img_features = self.img_encoder(input_image)  # (B, Cvae, H, W)
+        img_features = img_features.permute(0, 2, 3, 1) # (B, H, W, Cvae)
+        img_features = self.img_proj(img_features)  # (B, H, W, C)
+        img_features = img_features.permute(0, 3, 1, 2) # (B, C, H, W)
+
+        img_lst = []
+        for pn in self.patch_nums:
+            img_lst.append(F.interpolate(img_features, size=(pn, pn), mode='area').flatten(2).transpose(1, 2))
+
+        return img_lst
     
     @torch.no_grad()
     def autoregressive_infer_cfg(
-        self, B: int, g_seed: Optional[int] = None, top_k=0, top_p=0.0, more_smooth=False,
+        self, input_image: torch.Tensor, g_seed: Optional[int] = None, top_k=0, top_p=0.0, more_smooth=False,
     ) -> torch.Tensor:   # returns reconstructed image (B, 3, H, W) in [0, 1]
         """
         only used for inference, on autoregressive mode
@@ -134,8 +161,10 @@ class VAR(nn.Module):
         else: self.rng.manual_seed(g_seed); rng = self.rng
         
         # Initialize the autoregressive sequence with static start token
-        next_token_map = self.pos_start.expand(B, self.first_l, -1) + self.pos_1LC[:, :self.first_l]
+        B = input_image.shape[0]
+        img_tokens = self.encode_image(input_image)
 
+        next_token_map = self.pos_start.expand(B, self.first_l, -1) + self.pos_1LC[:, :self.first_l]
         cur_L = 0
         f_hat = torch.zeros(B, self.Cvae, self.patch_nums[-1], self.patch_nums[-1], device=next_token_map.device)
         
@@ -146,6 +175,12 @@ class VAR(nn.Module):
             cur_L += pn*pn
             
             x = next_token_map
+            # Cross-Attention with Image Tokens
+            CrossAttentionAR.forward
+            for cross_attn in self.cross_blocks:
+                x = cross_attn(f_d=x, f_var=img_tokens[si])
+
+            # Self-Attention on Mask Tokens
             AdaLNSelfAttn.forward
             for b in self.blocks:
                 x = b(x=x, attn_bias=None)
@@ -169,7 +204,7 @@ class VAR(nn.Module):
         for b in self.blocks: b.attn.kv_caching(False)
         return self.vae_proxy[0].fhat_to_img(f_hat).add_(1).mul_(0.5)   # de-normalize, from [-1, 1] to [0, 1]
     
-    def forward(self, x_BLCv_wo_first_l: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
+    def forward(self, x_BLCv_wo_first_l: torch.Tensor, input_image: torch.Tensor) -> torch.Tensor:  # returns logits_BLV
         """
         :param x_BLCv_wo_first_l: teacher forcing input (B, self.L-self.first_l, self.Cvae)
         :return: logits BLV, V is vocab_size
@@ -179,6 +214,8 @@ class VAR(nn.Module):
         
         with torch.amp.autocast('cuda', enabled=False):
             # Initialize SOS (without class embedding)
+            img_tokens = torch.cat(self.encode_image(input_image), dim=1)
+
             sos = self.pos_start.expand(B, self.first_l, -1)
 
             # Prepare input for transformer blocks
@@ -199,6 +236,10 @@ class VAR(nn.Module):
         # Convert tensors to proper dtype
         x_BLC = x_BLC.to(dtype=main_type)
         attn_bias = attn_bias.to(dtype=main_type)
+
+        CrossAttentionAR.forward
+        for cross_attn in self.cross_blocks:
+            x = cross_attn(f_d=x_BLC, f_var=img_tokens)
 
         AdaLNSelfAttn.forward
         for i, b in enumerate(self.blocks):

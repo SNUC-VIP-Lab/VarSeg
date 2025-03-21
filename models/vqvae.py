@@ -30,18 +30,18 @@ class VQVAE(nn.Module):
         self.test_mode = test_mode
         self.V, self.Cvae = vocab_size, z_channels
         # ddconfig is copied from https://github.com/CompVis/latent-diffusion/blob/e66308c7f2e64cb581c6d27ab6fbeb846828253b/models/first_stage_models/vq-f16/config.yaml
-        ddconfig = dict(
+        self.ddconfig = dict(
             dropout=dropout, ch=ch, z_channels=z_channels,
-            in_channels=1, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
+            in_channels=in_channels, ch_mult=(1, 1, 2, 2, 4), num_res_blocks=2,   # from vq-f16/config.yaml above
             using_sa=True, using_mid_sa=True,                           # from vq-f16/config.yaml above
             # resamp_with_conv=True,   # always True, removed.
         )
-        ddconfig.pop('double_z', None)  # only KL-VAE should use double_z=True
-        self.encoder = Encoder(double_z=False, **ddconfig)
-        self.decoder = Decoder(**ddconfig)
+        self.ddconfig.pop('double_z', None)  # only KL-VAE should use double_z=True
+        self.encoder = Encoder(double_z=False, **self.ddconfig)
+        self.decoder = Decoder(**self.ddconfig)
         
         self.vocab_size = vocab_size
-        self.downsample = 2 ** (len(ddconfig['ch_mult'])-1)
+        self.downsample = 2 ** (len(self.ddconfig['ch_mult'])-1)
         self.quantize: VectorQuantizer2 = VectorQuantizer2(
             vocab_size=vocab_size, Cvae=self.Cvae, using_znorm=using_znorm, beta=beta,
             default_qresi_counts=default_qresi_counts, v_patch_nums=v_patch_nums, quant_resi=quant_resi, share_quant_resi=share_quant_resi,
